@@ -1,0 +1,1632 @@
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Raw Data Player">
+<link rel="apple-touch-icon" href="https://file.garden/ZtcHYXae60zrZ_cY/raw-data-screenshot%2010.png">
+<link rel="apple-touch-icon" sizes="152x152" href="https://file.garden/ZtcHYXae60zrZ_cY/raw-data-screenshot%2010.png">
+<link rel="apple-touch-icon" sizes="180x180" href="https://file.garden/ZtcHYXae60zrZ_cY/raw-data-screenshot%2010.png">
+<link rel="apple-touch-icon" sizes="167x167" href="https://file.garden/ZtcHYXae60zrZ_cY/raw-data-screenshot%2010.png">
+<title>Raw Data Media Player with Customizable Parameters</title>
+<link rel="icon" type="image/png" href="https://file.garden/ZtcHYXae60zrZ_cY/raw-data-screenshot%2010.png">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+<script>
+let CANVAS_WIDTH = 32;
+let CANVAS_HEIGHT = 32;
+let AUDIO_BUFFER_SIZE = 1024; // Changed from 4096 to 1024
+let AUDIO_SAMPLE_RATE = 32000;
+let isStereo = false;
+let colorMode = 'rgb32';
+let isLooping = true;
+let pcmFormat = 'uint8';
+let useNearestNeighbor = true;
+let customSpeed = 1;
+let isPaused = false;
+let isCanvasUpsideDown = false;
+let isFixingLags = true; // Start with lag fixing enabled by default
+
+let canvas, ctx, audioCtx, gainNode, analyser;
+let waveformCanvas, waveformCtx;
+let oscilloscopeCanvas, oscilloscopeCtx;
+let showWaveform = false;
+let showOscilloscope = false;
+let isPlaying = false;
+let currentIndex = 0;
+let rawData = new Uint8Array();
+let playbackSpeed = 1;
+let normalSpeed = 1;
+let normalRewindSpeed = -2;
+
+let mediaRecorder = null;
+let recordedChunks = [];
+let isRecording = false;
+
+let hexCounter = 0;
+let intCounter = 0;
+let iconData = null;
+let imageRawData = null;
+let audioRawData = null;
+
+function initAudio() {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AudioContext({
+        sampleRate: AUDIO_SAMPLE_RATE,
+        latencyHint: 'interactive'
+    });
+    
+    gainNode = audioCtx.createGain();
+    const currentVolume = parseFloat(document.getElementById('volumeSlider').value);
+    gainNode.gain.setValueAtTime(currentVolume, audioCtx.currentTime);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    gainNode.connect(analyser);
+    analyser.connect(audioCtx.destination);
+    initOscilloscope();
+
+    // Auto resume audio context
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+}
+
+function fixIOSAudio() {
+    if (isIOS()) {
+        const silentBuffer = audioCtx.createBuffer(1, 1, 22050);
+        const source = audioCtx.createBufferSource();
+        source.buffer = silentBuffer;
+        source.connect(audioCtx.destination);
+        source.start();
+        
+        showAlert('iOS audio should now be fixed. Try playing audio again.');
+    } else {
+        showAlert('This fix is only needed for iOS devices.');
+    }
+}
+
+function showAlert(message) {
+    const alertDiv = document.createElement('div');
+    alertDiv.className = 'alert animate__animated animate__bounceIn';
+    alertDiv.innerHTML = `
+        <span class="closebtn" onclick="closeAlert(this.parentElement);">&times;</span>
+        ${message}
+    `;
+    document.body.appendChild(alertDiv);
+
+    setTimeout(() => {
+        closeAlertWithAnimation(alertDiv);
+    }, 5000);
+}
+
+function closeAlertWithAnimation(alertElement) {
+    alertElement.classList.remove('animate__bounceIn');
+    alertElement.classList.add('animate__bounceOut');
+    setTimeout(() => {
+        alertElement.remove();
+    }, 1000);
+}
+
+function closeAlert(alertElement) {
+    closeAlertWithAnimation(alertElement);
+}
+
+function togglePlayback() {
+    if (!isPlaying) {
+        currentIndex = 0;
+        document.getElementById('playButton').classList.add('animate__animated', 'animate__pulse');
+        setTimeout(() => {
+            document.getElementById('playButton').classList.remove('animate__animated', 'animate__pulse');
+        }, 500);
+        startPlayback();
+    } else {
+        if (isPaused) {
+            document.getElementById('playButton').textContent = 'Pause';
+            document.getElementById('playButton').classList.add('animate__animated', 'animate__pulse');
+            setTimeout(() => {
+                document.getElementById('playButton').classList.remove('animate__animated', 'animate__pulse');
+            }, 500);
+            isPaused = false;
+            playAudio();
+            requestAnimationFrame(updateCanvas);
+            if (showWaveform) drawWaveform();
+            if (showOscilloscope) drawOscilloscope();
+        } else {
+            document.getElementById('playButton').textContent = 'Resume';
+            document.getElementById('playButton').classList.add('animate__animated', 'animate__pulse');
+            setTimeout(() => {
+                document.getElementById('playButton').classList.remove('animate__animated', 'animate__pulse');
+            }, 500);
+            isPaused = true;
+            if (isRecording) {
+                stopRecording();
+            }
+        }
+    }
+}
+
+function startPlayback() {
+    if (!audioCtx) initAudio();
+    else {
+        const currentVolume = parseFloat(document.getElementById('volumeSlider').value);
+        gainNode.gain.setValueAtTime(currentVolume, audioCtx.currentTime);
+    }
+    if (isFixingLags) {
+        // Reduce quality temporarily to fix lags
+        CANVAS_WIDTH = Math.min(CANVAS_WIDTH, 128);
+        CANVAS_HEIGHT = Math.min(CANVAS_HEIGHT, 128);
+        AUDIO_BUFFER_SIZE = Math.min(AUDIO_BUFFER_SIZE, 1024); // Changed from 2048 to 1024
+        canvas.width = CANVAS_WIDTH;
+        canvas.height = CANVAS_HEIGHT;
+        showAlert('Quality reduced to prevent lags');
+    }
+    isPlaying = true;
+    isPaused = false;
+    playAudio();
+    requestAnimationFrame(updateCanvas);
+    if (showWaveform) {
+        drawWaveform();
+    }
+    if (showOscilloscope) {
+        drawOscilloscope();
+    }
+    document.getElementById('playButton').textContent = 'Pause';
+}
+
+function stopPlayback() {
+    isPlaying = false;
+    isPaused = false;
+    
+    // Stop any ongoing audio/visual processing
+    if (window.requestAnimationFrame) {
+        window.cancelAnimationFrame(updateCanvas);
+        window.cancelAnimationFrame(drawWaveform);
+        window.cancelAnimationFrame(drawOscilloscope);
+    }
+
+    // Force audio context cleanup
+    if (audioCtx) {
+        gainNode.disconnect();
+        analyser.disconnect();
+        audioCtx.close().then(() => {
+            audioCtx = null;
+            isPlaying = false;
+            isPaused = false;
+        });
+    }
+    
+    // Reset all playback state
+    currentIndex = 0;
+    playbackSpeed = normalSpeed;
+
+    document.getElementById('playButton').textContent = 'Play';
+    
+    // Clear canvases
+    if (ctx) ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+    if (waveformCtx) waveformCtx.clearRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+    if (oscilloscopeCtx) oscilloscopeCtx.clearRect(0, 0, oscilloscopeCanvas.width, oscilloscopeCanvas.height);
+    
+    // Reset position
+    currentIndex = 0;
+    document.getElementById('stopButton').classList.add('animate__animated', 'animate__pulse');
+    setTimeout(() => {
+        document.getElementById('stopButton').classList.remove('animate__animated', 'animate__pulse');
+    }, 500);
+    updatePositionCanvas();
+    updateCounters();
+}
+
+function restartPlayback() {
+    currentIndex = 0;
+    document.getElementById('restartButton').classList.add('animate__animated', 'animate__pulse');
+    setTimeout(() => {
+        document.getElementById('restartButton').classList.remove('animate__animated', 'animate__pulse');
+    }, 500);
+    updatePositionCanvas();
+    if (isPlaying) {
+        stopPlayback();
+        startPlayback();
+    } else {
+        if (!audioCtx) initAudio();
+        else {
+            const currentVolume = parseFloat(document.getElementById('volumeSlider').value);
+            gainNode.gain.setValueAtTime(currentVolume, audioCtx.currentTime);
+        }
+    }
+}
+
+function playAudio() {
+    if (!isPlaying || isPaused) return;
+
+    const channelCount = isStereo ? 2 : 1;
+    const buffer = audioCtx.createBuffer(channelCount, AUDIO_BUFFER_SIZE, AUDIO_SAMPLE_RATE);
+
+    for (let channel = 0; channel < channelCount; channel++) {
+        const channelData = buffer.getChannelData(channel);
+        for (let i = 0; i < AUDIO_BUFFER_SIZE; i++) {
+            const dataIndex = Math.floor((currentIndex + i * channelCount * playbackSpeed + channel) % rawData.length);
+            channelData[i] = convertPCMToFloat(Math.abs(dataIndex));
+        }
+    }
+
+    const bufferSource = audioCtx.createBufferSource();
+    bufferSource.buffer = buffer;
+    bufferSource.connect(gainNode);
+    bufferSource.start();
+
+    currentIndex = (currentIndex + AUDIO_BUFFER_SIZE * channelCount * playbackSpeed) % rawData.length;
+    if (currentIndex < 0) currentIndex += rawData.length;
+
+    updateCounters();
+    updateDuration();
+
+    if (!isLooping && (currentIndex < AUDIO_BUFFER_SIZE * channelCount * playbackSpeed || currentIndex > rawData.length - AUDIO_BUFFER_SIZE * channelCount * playbackSpeed)) {
+        bufferSource.onended = stopPlayback;
+    } else {
+        bufferSource.onended = () => {
+            if (!isPaused) playAudio();
+        };
+    }
+    
+    updatePositionCanvas();
+}
+
+function updateDuration() {
+    const totalSeconds = Math.floor(rawData.length / (AUDIO_SAMPLE_RATE * (isStereo ? 2 : 1)));
+    const currentSeconds = Math.floor(currentIndex / (AUDIO_SAMPLE_RATE * (isStereo ? 2 : 1)));
+    
+    const formatTime = (seconds) => {
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = seconds % 60;
+        return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+    };
+    
+    document.getElementById('currentTime').textContent = formatTime(currentSeconds);
+    document.getElementById('totalDuration').textContent = formatTime(totalSeconds);
+}
+
+function convertPCMToFloat(index) {
+    let value = 0;
+    const bytesPerSample = getBytesPerSample();
+
+    switch (pcmFormat) {
+        case 'uint8':
+            value = (rawData[index] - 128) / 128;
+            break;
+        case 'int16':
+            value = (rawData[index] << 8 | rawData[index + 1]) / 32768;
+            break;
+        case 'int24':
+            value = ((rawData[index] << 16 | rawData[index + 1] << 8 | rawData[index + 2]) << 8) / 2147483648;
+            break;
+        case 'int32':
+            value = (rawData[index] << 24 | rawData[index + 1] << 16 | rawData[index + 2] << 8 | rawData[index + 3]) / 2147483648;
+            break;
+        case 'uint16':
+            value = ((rawData[index] << 8 | rawData[index + 1]) - 32768) / 32768;
+            break;
+        case 'uint24':
+            value = ((rawData[index] << 16 | rawData[index + 1] << 8 | rawData[index + 2]) - 8388608) / 8388608;
+            break;
+        case 'uint32':
+            value = ((rawData[index] << 24 | rawData[index + 1] << 16 | rawData[index + 2] << 8 | rawData[index + 3]) - 2147483648) / 2147483648;
+            break;
+    }
+
+    return Math.max(-1, Math.min(1, value));
+}
+
+function getBytesPerSample() {
+    switch (pcmFormat) {
+        case 'uint8':
+            return 1;
+        case 'int16':
+        case 'uint16':
+            return 2;
+        case 'int24':
+        case 'uint24':
+            return 3;
+        case 'int32':
+        case 'uint32':
+            return 4;
+        default:
+            return 1;
+    }
+}
+
+function updateCounters() {
+    hexCounter = currentIndex;
+    intCounter = currentIndex;
+    document.getElementById('hexCounter').textContent = hexCounter.toString(16).padStart(8, '0');
+    document.getElementById('intCounter').textContent = intCounter.toLocaleString();
+}
+
+function updateCanvas() {
+    if (!isPlaying) return;
+
+    if (!isLooping && currentIndex >= rawData.length - 1) {
+        ctx.fillStyle = 'black';
+        ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+        return;
+    }
+
+    ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    let imageData = ctx.createImageData(CANVAS_WIDTH, CANVAS_HEIGHT);
+    let data = imageData.data;
+
+    for (let y = 0; y < CANVAS_HEIGHT; y++) {
+        for (let x = 0; x < CANVAS_WIDTH; x++) {
+            const pixelIndex = (y * CANVAS_WIDTH + x) * 4;
+            let r, g, b;
+
+            let dataIndex = (currentIndex + (y * CANVAS_WIDTH + x) * playbackSpeed) % rawData.length;
+            if (dataIndex < 0) dataIndex += rawData.length;
+
+            switch (colorMode) {
+                case 'rgb32':
+                    const index32 = (currentIndex + (y * CANVAS_WIDTH + x) * 4) % rawData.length;
+                    [b, g, r] = [rawData[index32], rawData[index32 + 1], rawData[index32 + 2]];
+                    break;
+                case 'rgb24':
+                    const index24 = (currentIndex + (y * CANVAS_WIDTH + x) * 3) % rawData.length;
+                    [r, g, b] = [rawData[index24], rawData[index24 + 1], rawData[index24 + 2]];
+                    break;
+                case 'rgb666':
+                    const index666 = (currentIndex + (y * CANVAS_WIDTH + x) * 3) % rawData.length;
+                    r = (rawData[index666] & 0xFC) >> 2;
+                    g = ((rawData[index666] & 0x03) << 4) | ((rawData[index666 + 1] & 0xF0) >> 4);
+                    b = ((rawData[index666 + 1] & 0x0F) << 2) | ((rawData[index666 + 2] & 0xC0) >> 6);
+                    r = (r << 2) | (r >> 4);
+                    g = (g << 2) | (g >> 4);
+                    b = (b << 2) | (b >> 4);
+                    break;
+                case 'rgb555':
+                    const index555 = (currentIndex + (y * CANVAS_WIDTH + x) * 2) % rawData.length;
+                    const pixel = (rawData[index555 + 1] << 8) | rawData[index555];
+                    r = ((pixel >> 10) & 0x1F) << 3;
+                    g = ((pixel >> 5) & 0x1F) << 3;
+                    b = (pixel & 0x1F) << 3;
+                    r |= r >> 5;
+                    g |= g >> 5;
+                    b |= b >> 5;
+                    break;
+                case 'rgb565':
+                    const index565 = (currentIndex + (y * CANVAS_WIDTH + x) * 2) % rawData.length;
+                    const pixel565 = (rawData[index565] << 8) | rawData[index565 + 1];
+                    r = ((pixel565 >> 11) & 0x1F) << 3;
+                    g = ((pixel565 >> 5) & 0x3F) << 2;
+                    b = (pixel565 & 0x1F) << 3;
+                    r |= r >> 5;
+                    g |= g >> 6;
+                    b |= b >> 5;
+                    break;
+                case 'rgb8':
+                    const index8 = (currentIndex + Math.floor((y * CANVAS_WIDTH + x) / 2)) % rawData.length;
+                    const value8 = (x % 2 === 0) ? (rawData[index8] >> 4) : (rawData[index8] & 0x0F);
+                    r = g = b = (value8 * 255) / 15;
+                    break;
+                case 'rgb4':
+                    const index4 = (currentIndex + Math.floor((y * CANVAS_WIDTH + x) / 4)) % rawData.length;
+                    const shift4 = (x % 4) * 2;
+                    const value4 = (rawData[index4] >> shift4) & 0x03;
+                    r = g = b = (value4 * 255) / 3;
+                    break;
+                case 'rgb128':
+                    const index128 = (currentIndex + (y * CANVAS_WIDTH + x) * 16) % rawData.length;
+                    r = rawData[index128];
+                    g = rawData[index128 + 1];
+                    b = rawData[index128 + 2];
+                    break;
+                case 'rgb64':
+                    const index64 = (currentIndex + (y * CANVAS_WIDTH + x) * 8) % rawData.length;
+                    r = rawData[index64];
+                    g = rawData[index64 + 1];
+                    b = rawData[index64 + 2];
+                    break;
+                case 'rgb16':
+                    const index16 = (currentIndex + (y * CANVAS_WIDTH + x) * 2) % rawData.length;
+                    const pixel16 = (rawData[index16] << 8) | rawData[index16 + 1];
+                    r = ((pixel16 >> 11) & 0x1F) << 3;
+                    g = ((pixel16 >> 5) & 0x3F) << 2;
+                    b = (pixel16 & 0x1F) << 3;
+                    r |= r >> 5;
+                    g |= g >> 6;
+                    b |= b >> 5;
+                    break;
+                case 'rgb3':
+                    const index3 = (currentIndex + Math.floor((y * CANVAS_WIDTH + x) * 3 / 8)) % rawData.length;
+                    const shift3 = (y * CANVAS_WIDTH + x) % 8 * 3;
+                    const value3 = (rawData[index3] >> shift3) & 0x07;
+                    r = g = b = (value3 * 255) / 7;
+                    break;
+                case 'rgb33':
+                    const index33 = (currentIndex + Math.floor((y * CANVAS_WIDTH + x) * 33 / 8)) % rawData.length;
+                    const byte1 = rawData[index33];
+                    const byte2 = rawData[index33 + 1];
+                    const byte3 = rawData[index33 + 2];
+                    const byte4 = rawData[index33 + 3];
+                    const byte5 = rawData[index33 + 4];
+                    r = ((byte1 << 3) | (byte2 >> 5)) & 0xFF;
+                    g = (((byte2 & 0x1F) << 6) | (byte3 >> 2)) & 0xFF;
+                    b = (((byte3 & 0x03) << 9) | (byte4 << 1) | (byte5 >> 7)) & 0xFF;
+                    break;
+                case 'rgb2':
+                    const index2 = (currentIndex + Math.floor((y * CANVAS_WIDTH + x) / 4)) % rawData.length;
+                    const shift = (y * CANVAS_WIDTH + x) % 4 * 2;
+                    const value = (rawData[index2] >> shift) & 0x03;
+                    r = g = b = (value * 255) / 3;
+                    break;
+                case 'rgb1':
+                    const index1 = (currentIndex + Math.floor((y * CANVAS_WIDTH + x) / 8)) % rawData.length;
+                    const bit = (y * CANVAS_WIDTH + x) % 8;
+                    r = g = b = (rawData[index1] & (1 << bit)) ? 255 : 0;
+                    break;
+            }
+
+            const canvasY = isCanvasUpsideDown ? (CANVAS_HEIGHT - 1 - y) : y;
+            const canvasIndex = (canvasY * CANVAS_WIDTH + x) * 4;
+
+            data[canvasIndex] = r;
+            data[canvasIndex + 1] = g;
+            data[canvasIndex + 2] = b;
+            data[canvasIndex + 3] = 255;
+        }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+    updatePositionCanvas();
+
+    requestAnimationFrame(updateCanvas);
+}
+
+function update60FPSCounters() {
+    updateCounters();
+    updateDuration();
+    requestAnimationFrame(update60FPSCounters);
+}
+
+function updateCanvasPosition() {
+    const rect = canvas.getBoundingClientRect();
+}
+
+function drawWaveform() {
+    if (!showWaveform || isPaused) return;
+
+    requestAnimationFrame(drawWaveform);
+
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    analyser.getByteTimeDomainData(dataArray);
+
+    waveformCtx.fillStyle = 'rgb(200, 200, 200)';
+    waveformCtx.fillRect(0, 0, waveformCanvas.width, waveformCanvas.height);
+
+    waveformCtx.lineWidth = 2;
+    waveformCtx.strokeStyle = 'rgb(0, 0, 0)';
+
+    waveformCtx.beginPath();
+
+    const sliceWidth = waveformCanvas.width * 1.0 / bufferLength;
+    let x = 0;
+
+    for (let i = 0; i < bufferLength; i++) {
+        const v = dataArray[i] / 128.0;
+        const y = waveformCanvas.height - (v * waveformCanvas.height / 2);
+
+        if (i === 0) {
+            waveformCtx.moveTo(x, y);
+        } else {
+            waveformCtx.lineTo(x, y);
+        }
+
+        x += sliceWidth;
+    }
+
+    waveformCtx.lineTo(waveformCanvas.width, waveformCanvas.height / 2);
+    waveformCtx.stroke();
+}
+
+function handleFileSelect(event) {
+    const file = event.target.files[0];
+    const reader = new FileReader();
+
+    reader.onload = function(e) {
+        rawData = new Uint8Array(e.target.result);
+        document.getElementById('playButton').disabled = false;
+        showAlert('File loaded successfully. You can now play it.');
+    };
+
+    reader.readAsArrayBuffer(file);
+}
+
+function generateRandomData() {
+    let bytesPerPixel;
+    switch (colorMode) {
+        case 'rgb32': bytesPerPixel = 4; break;
+        case 'rgb24':
+        case 'rgb666': bytesPerPixel = 3; break;
+        case 'rgb565': bytesPerPixel = 2; break;
+        case 'rgb8': bytesPerPixel = 1/2; break;
+        case 'rgb4': bytesPerPixel = 1/4; break;
+        case 'rgb555': bytesPerPixel = 2; break;
+        case 'rgb128': bytesPerPixel = 16; break;
+        case 'rgb64': bytesPerPixel = 8; break;
+        case 'rgb16': bytesPerPixel = 2; break;
+        case 'rgb3': bytesPerPixel = 3/8; break;
+        case 'rgb33': bytesPerPixel = 33/8; break;
+        case 'rgb2': bytesPerPixel = 1/4; break;
+        case 'rgb1': bytesPerPixel = 1/8; break;
+    }
+    const dataSize = Math.ceil(CANVAS_WIDTH * CANVAS_HEIGHT * bytesPerPixel * 60 * 10);
+    rawData = new Uint8Array(dataSize);
+    for (let i = 0; i < dataSize; i++) {
+        rawData[i] = Math.floor(Math.random() * 256);
+    }
+    document.getElementById('playButton').disabled = false;
+    document.getElementById('generateButton').classList.add('animate__animated', 'animate__pulse');
+    setTimeout(() => {
+        document.getElementById('generateButton').classList.remove('animate__animated', 'animate__pulse');
+    }, 500);
+    showAlert('Random data generated successfully. You can now play it.');
+}
+
+function changeVolume() {
+    if (gainNode) {
+        const volume = parseFloat(document.getElementById('volumeSlider').value);
+        gainNode.gain.setValueAtTime(volume, audioCtx.currentTime);
+    }
+}
+
+function updateCanvasSize() {
+    CANVAS_WIDTH = Math.min(parseInt(document.getElementById('canvasWidthInput').value) || 32, 256);
+    CANVAS_HEIGHT = Math.min(parseInt(document.getElementById('canvasHeightInput').value) || 32, 256);
+    canvas.width = CANVAS_WIDTH;
+    canvas.height = CANVAS_HEIGHT;
+    
+    canvas.style.width = '100%';
+    canvas.style.maxWidth = `${CANVAS_WIDTH * 10}px`;
+    canvas.style.height = 'auto';
+    
+    updateCanvasScaling();
+    
+    if (isPlaying) {
+        stopPlayback();
+        startPlayback();
+    }
+    saveCookies();
+}
+
+function handleResize() {
+    const wasPlaying = isPlaying;
+    const wasPaused = isPaused;
+    
+    updateCanvasSize();
+    updateCanvasScaling();
+    
+    if (wasPlaying && !wasPaused) {
+        requestAnimationFrame(updateCanvas);
+    }
+}
+
+window.addEventListener('scroll', updateCanvasPosition);
+
+window.addEventListener('resize', handleResize);
+
+function updateSampleRate() {
+    AUDIO_SAMPLE_RATE = parseInt(document.getElementById('sampleRateInput').value) || 32000;
+    if (audioCtx) {
+        stopPlayback();
+        initAudio();
+        startPlayback();
+    }
+    saveCookies();
+}
+
+function toggleStereo() {
+    isStereo = !isStereo;
+    document.getElementById('toggleStereoButton').textContent = isStereo ? 'Switch to Mono' : 'Switch to Stereo';
+    if (isPlaying) {
+        stopPlayback();
+        startPlayback();
+    }
+}
+
+function changeColorMode() {
+    colorMode = document.getElementById('colorModeSelect').value;
+    generateRandomData();
+    if (isPlaying) {
+        stopPlayback();
+        startPlayback();
+    }
+    saveCookies();
+}
+
+function takeScreenshot() {
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = CANVAS_WIDTH * 10;
+    tempCanvas.height = CANVAS_HEIGHT * 10;
+    const tempCtx = tempCanvas.getContext('2d');
+
+    tempCtx.imageSmoothingEnabled = false;
+    tempCtx.drawImage(canvas, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT, 0, 0, tempCanvas.width, tempCanvas.height);
+
+    const dataURL = tempCanvas.toDataURL('image/png');
+    const link = document.createElement('a');
+    link.href = dataURL;
+    link.download = 'raw-data-screenshot.png';
+    link.click();
+    showAlert('Screenshot taken.');
+}
+
+function toggleLoop() {
+    isLooping = document.getElementById('loopCheckbox').checked;
+}
+
+function changePCMFormat() {
+    pcmFormat = document.getElementById('pcmFormatSelect').value;
+    generateRandomData();
+    if (isPlaying) {
+        stopPlayback();
+        startPlayback();
+    }
+    saveCookies();
+}
+
+function toggleNearestNeighbor() {
+    useNearestNeighbor = document.getElementById('nearestNeighborCheckbox').checked;
+    updateCanvasScaling();
+    if (isPlaying) {
+        stopPlayback();
+        startPlayback();
+    }
+}
+
+function updateCanvasScaling() {
+    if (useNearestNeighbor) {
+        canvas.style.imageRendering = 'pixelated';
+    } else {
+        canvas.style.imageRendering = 'auto';
+    }
+}
+
+function setCookie(name, value, days) {
+    const expires = new Date();
+    expires.setTime(expires.getTime() + (days * 24 * 60 * 60 * 1000));
+    document.cookie = name + '=' + value + ';expires=' + expires.toUTCString() + ';path=/';
+}
+
+function getCookie(name) {
+    const nameEQ = name + "=";
+    const ca = document.cookie.split(';');
+    for(let i = 0; i < ca.length; i++) {
+        let c = ca[i];
+        while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+        if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length, c.length);
+    }
+    return null;
+}
+
+function saveCookies() {
+    setCookie('sampleRate', AUDIO_SAMPLE_RATE, 30);
+    setCookie('canvasWidth', Math.min(CANVAS_WIDTH, 512), 30);
+    setCookie('canvasHeight', Math.min(CANVAS_HEIGHT, 512), 30);
+    setCookie('colorMode', colorMode, 30);
+    setCookie('pcmFormat', pcmFormat, 30);
+    setCookie('canvasOrientation', isCanvasUpsideDown ? 'upsidedown' : 'normal', 30);
+}
+
+function loadCookies() {
+    const savedSampleRate = getCookie('sampleRate');
+    const savedCanvasWidth = getCookie('canvasWidth');
+    const savedCanvasHeight = getCookie('canvasHeight');
+    const savedColorMode = getCookie('colorMode');
+    const savedPCMFormat = getCookie('pcmFormat');
+    const savedCanvasOrientation = getCookie('canvasOrientation');
+
+    if (savedSampleRate) {
+        AUDIO_SAMPLE_RATE = parseInt(savedSampleRate);
+        document.getElementById('sampleRateInput').value = AUDIO_SAMPLE_RATE;
+    }
+    if (savedCanvasWidth) {
+        CANVAS_WIDTH = Math.min(parseInt(savedCanvasWidth), 256);
+        document.getElementById('canvasWidthInput').value = CANVAS_WIDTH;
+    }
+    if (savedCanvasHeight) {
+        CANVAS_HEIGHT = Math.min(parseInt(savedCanvasHeight), 256);
+        document.getElementById('canvasHeightInput').value = CANVAS_HEIGHT;
+    }
+    if (savedColorMode) {
+        colorMode = savedColorMode;
+        document.getElementById('colorModeSelect').value = colorMode;
+    }
+    if (savedPCMFormat) {
+        pcmFormat = savedPCMFormat;
+        document.getElementById('pcmFormatSelect').value = pcmFormat;
+    }
+    if (savedCanvasOrientation) {
+        isCanvasUpsideDown = savedCanvasOrientation === 'upsidedown';
+        document.getElementById('toggleCanvasOrientationButton').textContent = isCanvasUpsideDown ? 'Flip Canvas Up' : 'Flip Canvas Down';
+    }
+}
+
+function toggleWaveform() {
+    showWaveform = document.getElementById('waveformCheckbox').checked;
+    waveformCanvas.style.display = showWaveform ? 'block' : 'none';
+    if (showWaveform && isPlaying && !isPaused) {
+        drawWaveform();
+    }
+}
+
+function isIOS() {
+    return [
+        'iPad Simulator',
+        'iPhone Simulator',
+        'iPod Simulator',
+        'iPad',
+        'iPhone',
+        'iPod'
+    ].includes(navigator.platform)
+    || (navigator.userAgent.includes("Mac") && "ontouchend" in document);
+}
+
+function fixCanvasGoingFast() {
+    if (isPlaying) {
+        stopPlayback();
+    }
+    
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = canvas.width;
+    tempCanvas.height = canvas.height;
+    const tempCtx = tempCanvas.getContext('2d');
+    tempCtx.drawImage(canvas, 0, 0);
+    
+    canvas.width = canvas.width;
+    ctx.drawImage(tempCanvas, 0, 0);
+    
+    if (isPlaying) {
+        startPlayback();
+    }
+    
+    showAlert('Canvas has been reset. This should fix any speed-related issues.');
+}
+
+function initOscilloscope() {
+    oscilloscopeCanvas = document.getElementById('oscilloscope');
+    oscilloscopeCtx = oscilloscopeCanvas.getContext('2d');
+    oscilloscopeCanvas.width = 300;
+    oscilloscopeCanvas.height = 300;
+}
+
+function updatePositionCanvas() {
+    const posCanvas = document.getElementById('positionCanvas');
+    const posCtx = posCanvas.getContext('2d');
+    
+    // Clear canvas
+    posCtx.clearRect(0, 0, posCanvas.width, posCanvas.height);
+    
+    // Calculate position percentage
+    const percentage = (currentIndex / rawData.length) * posCanvas.width;
+    
+    // Draw background
+    posCtx.fillStyle = '#eee';
+    posCtx.fillRect(0, 0, posCanvas.width, posCanvas.height);
+    
+    // Draw position indicator
+    posCtx.fillStyle = '#4CAF50';
+    posCtx.fillRect(0, 0, percentage, posCanvas.height);
+}
+
+function drawOscilloscope() {
+    if (!showOscilloscope || isPaused) return;
+
+    requestAnimationFrame(drawOscilloscope);
+
+    const bufferLength = analyser.fftSize;
+    const dataArray = new Float32Array(bufferLength);
+    analyser.getFloatTimeDomainData(dataArray);
+
+    oscilloscopeCtx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+    oscilloscopeCtx.fillRect(0, 0, oscilloscopeCanvas.width, oscilloscopeCanvas.height);
+
+    oscilloscopeCtx.lineWidth = 2;
+    oscilloscopeCtx.strokeStyle = 'rgb(0, 255, 0)';
+    oscilloscopeCtx.beginPath();
+
+    for (let i = 0; i < bufferLength; i += 2) {
+        const x = dataArray[i] * oscilloscopeCanvas.width / 2 + oscilloscopeCanvas.width / 2;
+        const y = oscilloscopeCanvas.height - (dataArray[i + 1] * oscilloscopeCanvas.height / 2 + oscilloscopeCanvas.height / 2);
+        
+        if (i === 0) {
+            oscilloscopeCtx.moveTo(x, y);
+        } else {
+            oscilloscopeCtx.lineTo(x, y);
+        }
+    }
+
+    oscilloscopeCtx.stroke();
+}
+
+function toggleOscilloscope() {
+    showOscilloscope = document.getElementById('oscilloscopeCheckbox').checked;
+    oscilloscopeCanvas.style.display = showOscilloscope ? 'block' : 'none';
+    if (showOscilloscope && isPlaying && !isPaused) {
+        drawOscilloscope();
+    }
+}
+
+function startRecording() {
+    document.getElementById('startRecordingButton').disabled = true;
+    
+    recordedChunks = [];
+    
+    // Create high resolution temporary canvas for recording
+    const recordCanvas = document.createElement('canvas');
+    recordCanvas.width = 256;
+    recordCanvas.height = 256;
+    const recordCtx = recordCanvas.getContext('2d', {
+        alpha: false,
+        desynchronized: true
+    });
+    recordCtx.imageSmoothingEnabled = false;
+    
+    // Start playback if not already playing
+    if (!isPlaying) {
+        startPlayback();
+    } else if (isPaused) {
+        togglePlayback();
+    }
+
+    // Calculate total duration in seconds
+    const totalSeconds = Math.floor(rawData.length / (AUDIO_SAMPLE_RATE * (isStereo ? 2 : 1)));
+    const startTime = Date.now();
+    
+    // Create optimized canvas stream with higher resolution
+    const canvasStream = recordCanvas.captureStream(60);
+    let audioTracks = [];
+    
+    if (audioCtx) {
+        const audioDestination = audioCtx.createMediaStreamDestination();
+        gainNode.connect(audioDestination);
+        audioTracks = audioDestination.stream.getAudioTracks();
+    }
+    
+    const tracks = [...canvasStream.getVideoTracks(), ...audioTracks];
+    const combinedStream = new MediaStream(tracks);
+    
+    try {
+        mediaRecorder = new MediaRecorder(combinedStream, {
+            mimeType: 'video/mp4',
+            videoBitsPerSecond: 20000000, // Increased for higher quality
+            audioBitsPerSecond: 256000
+        });
+    } catch (e) {
+        showAlert('MP4 recording not supported in this browser.');
+        document.getElementById('startRecordingButton').disabled = false;
+        return;
+    }
+
+    mediaRecorder.ondataavailable = handleDataAvailable;
+    mediaRecorder.onstop = handleStop;
+
+    // Optimized render loop for recording with duration check
+    const renderFrame = () => {
+        if (!isRecording) return;
+        
+        recordCtx.drawImage(canvas, 0, 0, CANVAS_WIDTH, CANVAS_HEIGHT, 
+                           0, 0, recordCanvas.width, recordCanvas.height);
+                           
+        const elapsedTime = Math.floor((Date.now() - startTime) / 1000);
+        document.getElementById('startRecordingButton').textContent = 
+            `Recording... ${elapsedTime}s / ${totalSeconds}s`;
+            
+        // Check if we've reached the end of the data or estimated duration
+        if (!isPlaying || (!isLooping && currentIndex >= rawData.length - 1) || elapsedTime >= totalSeconds) {
+            stopRecording();
+            return;
+        }
+        
+        requestAnimationFrame(renderFrame);
+    };
+    
+    mediaRecorder.start(1000/60); // Start with 60fps chunks
+    isRecording = true;
+    renderFrame();
+    document.getElementById('stopRecordingButton').style.display = 'inline-block';
+    document.getElementById('stopRecordingButton').disabled = false;
+    
+    document.getElementById('startRecordingButton').textContent = 'Recording... 0s / ' + totalSeconds + 's';
+    showAlert('Recording started in high quality 2048x2048 MP4...');
+}
+
+function stopRecording() {
+    if (mediaRecorder && isRecording) {
+        mediaRecorder.stop();
+        isRecording = false;
+
+        // Pause playback when stopping recording
+        if (!isPaused) {
+            togglePlayback(); // This will pause the playback
+        }
+
+        document.getElementById('stopRecordingButton').classList.add('animate__animated', 'animate__pulse');
+        setTimeout(() => {
+            document.getElementById('stopRecordingButton').classList.remove('animate__animated', 'animate__pulse');
+        }, 500); 
+        
+        document.getElementById('stopRecordingButton').style.display = 'none';
+        document.getElementById('startRecordingButton').disabled = false;
+        document.getElementById('startRecordingButton').textContent = 'Start Recording';
+    } else {
+        showAlert('No recording in progress.');
+    }
+}
+
+function handleDataAvailable(event) {
+    if (event.data.size > 0) {
+        recordedChunks.push(event.data);
+    }
+}
+
+function handleStop() {
+    if (recordedChunks.length > 0) {
+        const blob = new Blob(recordedChunks, {
+            type: 'video/mp4'
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'canvas-recording-hq.mp4';
+        a.click();
+        URL.revokeObjectURL(url);
+        showAlert('High quality MP4 recording saved with audio!');
+        recordedChunks = [];
+    } else {
+        showAlert('No recorded data available.');
+    }
+}
+
+function generateBytebeat() {
+        const formula = document.getElementById('bytebeatFormula').value
+            .replace(/\b(sin|cos|tan|abs|sqrt|pow|floor|ceil|round|PI|log|exp|min|max|random|asin|acos|atan|atan2|sinh|cosh|tanh|sign|trunc|log2|log10)\b/g, 'Math.$1');
+
+        
+    const duration = parseInt(document.getElementById('bytebeatDuration').value);
+    const sampleType = document.getElementById('bytebeatSampleType').value;
+    const isFloatbeat = document.getElementById('bytebeatType').value === 'floatbeat';
+    const sampleCount = AUDIO_SAMPLE_RATE * duration;
+    
+    try {
+        const evalFormula = new Function('t', 'f', `return ${formula}`);
+        const samples = new Uint8Array(sampleCount);
+        let lastValue = 0;
+        
+        for (let t = 0; t < sampleCount; t++) {
+            let value = evalFormula(t, lastValue);
+            
+            if (isFloatbeat) {
+                // Clamp floatbeat value between -1 and 1, then scale to 0-255
+                value = Math.max(-1, Math.min(1, value));
+                value = (value + 1) * 127.5;
+                lastValue = value;
+            } else {
+                value = Math.floor(((value % 256) + 256) % 256);
+            }
+            
+            if (sampleType === 'int8') {
+                value = value > 127 ? value - 256 : value;
+            }
+            samples[t] = Math.floor(value);
+        }
+        
+        rawData = samples;
+        document.getElementById('playButton').disabled = false;
+        showAlert(`${isFloatbeat ? 'Floatbeat' : 'Bytebeat'} audio generated successfully.`);
+        
+    } catch (error) {
+        showAlert(`Error in ${isFloatbeat ? 'floatbeat' : 'bytebeat'} formula. Please check your syntax.`);
+        console.error('Generation error:', error);
+    }
+}
+</script>
+<style>
+body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+    background-color: #f0f0f0;
+    font-family: Arial, sans-serif;
+    padding: 20px;
+    box-sizing: border-box;
+}
+.alert {
+  padding: 20px;
+  background-color: #f44336;
+  color: white;
+  margin-bottom: 15px;
+  position: fixed;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  border-radius: 5px;
+  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+.closebtn {
+  margin-left: 15px;
+  color: white;
+  font-weight: bold;
+  float: right;
+  font-size: 22px;
+  line-height: 20px;
+  cursor: pointer;
+  transition: 0.3s;
+}
+.closebtn:hover {
+  color: black;
+}
+canvas {
+    border: 1px solid #000;
+    image-rendering: pixelated;
+    max-width: 100%;
+    height: auto;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+input, button, select {
+    margin: 5px;
+    padding: 10px 15px;
+    font-size: 16px;
+    border: none;
+    border-radius: 5px;
+    background-color: #4CAF50;
+    color: white;
+    cursor: pointer;
+    transition: background-color 0.3s;
+}
+input[type="file"], input[type="number"], input[type="range"], select {
+    background-color: white;
+    color: #333;
+    border: 1px solid #ccc;
+}
+input:hover, button:hover, select:hover {
+    background-color: #45a049;
+}
+input[type="file"]:hover, input[type="number"]:hover, input[type="range"]:hover, select:hover {
+    background-color: #f5f5f5;
+}
+#volumeControl, #canvasSizeControl, #sampleRateControl, #colorModeControl, #pcmFormatControl, #iconConverterSection, #reversedIconConverterSection, #imageConverterSection, #audioConverterSection, #oscilloscopeControl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 10px 0;
+}
+#volumeSlider {
+    width: 100%;
+    max-width: 200px;
+}
+.control-group {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    margin-bottom: 20px;
+    width: 100%;
+    background-color: #fff;
+    padding: 20px;
+    border-radius: 10px;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+}
+h1 {
+    text-align: center;
+    margin-bottom: 20px;
+    font-size: 28px;
+    color: #333;
+    position: relative;
+}
+h1 .label {
+    font-size: 14px;
+    background-color: #4CAF50;
+    color: white;
+    padding: 5px 10px;
+    border-radius: 15px;
+    position: absolute;
+    top: -10px;
+    right: -10px;
+    transform: rotate(10deg);
+}
+@media (max-width: 768px) {
+    h1 {
+        font-size: 24px;
+    }
+    h1 .label {
+        font-size: 12px;
+        top: -5px;
+        right: -5px;
+    }
+}
+#waveform {
+    width: 100%;
+    max-width: 800px;
+    height: 200px;
+    border: 1px solid #000;
+    display: none;
+    margin-top: 20px;
+}
+#positionCanvas {
+    width: 100%;
+    max-width: 800px;
+    height: 20px;
+    border: 1px solid #000;
+    margin-top: 10px;
+}
+#oscilloscope {
+    width: 300px;
+    height: 300px;
+    border: 1px solid #000;
+    display: none;
+    margin-top: 20px;
+}
+#counterControl {
+    display: flex;
+    justify-content: space-between;
+    width: 100%;
+    max-width: 400px;
+    margin: 10px auto;
+    font-family: monospace;
+    font-size: 16px;
+}
+#counterControl span {
+    background-color: #f0f0f0;
+    padding: 5px 10px;
+    border-radius: 5px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+#normalRewindButton, #normalButton,
+#fixCanvasButton, #fixAudioButton, #aboutButton, #restartButton, #toggleCanvasOrientationButton, #convertToIconButton, #reversedConvertToIconButton, #importIconDataButton, #convertImageButton, #downloadIconButton, #reversedDownloadIconButton, #fixIOSAudioButton, #fixLagsButton {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 10px 15px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 14px;
+    margin: 4px 2px;
+    cursor: pointer;
+    border-radius: 5px;
+}
+#normalRewindButton:hover, #normalButton:hover,
+#fixCanvasButton:hover, #fixAudioButton:hover, #aboutButton:hover, #restartButton:hover, #toggleCanvasOrientationButton:hover, #downloadIconButton:hover, #fixIOSAudioButton:hover, #fixLagsButton:hover {
+    background-color: #45a049;
+}
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0,0,0,0.4);
+}
+.modal-content {
+    background-color: #fefefe;
+    margin: 15% auto;
+    padding: 20px;
+    border: 1px solid #888;
+    width: 80%;
+    max-width: 600px;
+    border-radius: 5px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+.close {
+    color: #aaa;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+}
+.close:hover,
+.close:focus {
+    color: #000;
+    text-decoration: none;
+    cursor: pointer;
+}
+#aboutButton {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 10px 15px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 14px;
+    margin: 4px 2px;
+    cursor: pointer;
+    border-radius: 5px;
+}
+#aboutButton:hover {
+    background-color: #45a049;
+}
+
+#bytebeatFormula {
+    font-family: monospace;
+    padding: 10px;
+    margin: 10px 0;
+    width: 100%;
+    max-width: 400px;
+    border: 1px solid #ccc;
+    border-radius: 5px;
+    resize: vertical;
+}
+
+#bytebeatSection {
+    margin-top: 20px;
+}
+
+#bytebeatSection select,
+#bytebeatSection input[type="number"] {
+    padding: 5px;
+    margin: 5px;
+}
+</style>
+</head>
+<body>
+    <h1>Raw Data Media Player <span class="label">By BeFucker (Github)</span></h1>
+    <canvas id="canvas"></canvas>
+    <canvas id="waveform"></canvas>
+    <canvas id="oscilloscope"></canvas>
+    <canvas id="positionCanvas"></canvas>
+    <div class="control-group">
+        <input type="file" id="fileInput" accept="*.*">
+        <button id="playButton" disabled>Play</button>
+        <button id="stopButton">Stop</button>
+        <button id="restartButton">Restart</button>
+        <button id="generateButton">Generate Random Data</button>
+        <button id="toggleStereoButton">Switch to Stereo</button>
+        <button id="screenshotButton">Take Screenshot</button>
+        <button id="startRecordingButton">Start Recording</button>
+        <button id="stopRecordingButton">Stop Recording</button>
+        <select id="recordingFormat">
+            <option value="video/mp4">MP4</option>
+        </select>
+        <button id="fixIOSAudioButton">Fix iOS Audio</button>
+        <button id="fixLagsButton">Restore Quality</button>
+        <button id="normalRewindButton">Normal Rewind</button>
+        <button id="normalButton">Normal</button>
+        <label for="loopCheckbox">
+            <input type="checkbox" id="loopCheckbox" checked> Loop
+        </label>
+        <label for="nearestNeighborCheckbox">
+            <input type="checkbox" id="nearestNeighborCheckbox" checked> Nearest-neighbor scaling
+        </label>
+        <label for="waveformCheckbox">
+            <input type="checkbox" id="waveformCheckbox"> Show Waveform
+        </label>
+        <label for="oscilloscopeCheckbox">
+            <input type="checkbox" id="oscilloscopeCheckbox"> Show XY Oscilloscope
+        </label>
+        <button id="toggleCanvasOrientationButton">Toggle Canvas Orientation</button>
+        <button id="fixCanvasButton">Fix Canvas Going Fast</button>
+        <button id="fixAudioButton">Fix Audio</button>
+        <button id="aboutButton">About</button>
+    </div>
+    <div class="control-group">
+        <div id="counterControl">
+            <span>Hex Counter: <span id="hexCounter">0x00000000</span></span>
+            <span>Int Counter: <span id="intCounter">0</span></span>
+        </div>
+    </div>
+    <div class="control-group">
+        <div id="durationControl">
+            <span id="currentTime">0:00</span> / <span id="totalDuration">0:00</span>
+        </div>
+    </div>
+    <div class="control-group">
+        <div id="volumeControl">
+            <label for="volumeSlider">Volume:</label>
+            <input type="range" id="volumeSlider" min="0" max="1" step="0.1" value="0.5">
+        </div>
+        <div id="canvasSizeControl">
+            <label for="canvasWidthInput">Canvas Width:</label>
+            <input type="number" id="canvasWidthInput" min="1" max="256" value="32">
+            <label for="canvasHeightInput">Height:</label>
+            <input type="number" id="canvasHeightInput" min="1" max="256" value="32">
+        </div>
+        <div id="sampleRateControl">
+            <label for="sampleRateInput">Sample Rate:</label>
+            <input type="number" id="sampleRateInput" min="8000" max="192000" step="1000" value="32000">
+        </div>
+        <div id="colorModeControl">
+            <label for="colorModeSelect">Color Mode:</label>
+            <select id="colorModeSelect">
+                <option value="rgb32">RGB32</option>
+                <option value="rgb24">RGB24</option>
+                <option value="rgb666">RGB666</option>
+                <option value="rgb555">RGB555</option>
+                <option value="rgb565">RGB565</option>
+                <option value="rgb128">RGB128</option>
+                <option value="rgb64">RGB64</option>
+                <option value="rgb16">RGB16</option>
+                <option value="rgb8">RGB8</option>
+                <option value="rgb4">RGB4</option>
+                <option value="rgb3">RGB3</option>
+                <option value="rgb33">RGB33</option>
+                <option value="rgb2">RGB2</option>
+                <option value="rgb1">RGB1</option>
+            </select>
+        </div>
+        <div id="pcmFormatControl">
+            <label for="pcmFormatSelect">PCM Format:</label>
+            <select id="pcmFormatSelect">
+                <option value="uint8">Unsigned 8-bit PCM</option>
+                <option value="int16">Signed 16-bit PCM</option>
+                <option value="int24">Signed 24-bit PCM</option>
+                <option value="int32">Signed 32-bit PCM</option>
+                <option value="uint16">Unsigned 16-bit PCM</option>
+                <option value="uint24">Unsigned 24-bit PCM</option>
+                <option value="uint32">Unsigned 32-bit PCM</option>
+            </select>
+        </div>
+    </div>
+    <div class="control-group" id="iconConverterSection">
+        <h3>Image to Icon Converter</h3>
+        <input type="file" id="iconInput" accept="image/*">
+        <div id="iconSizes">
+            <label><input type="checkbox" value="256" checked> 256x256</label>
+            <label><input type="checkbox" value="128" checked> 128x128</label>
+            <label><input type="checkbox" value="96" checked> 96x96</label>
+            <label><input type="checkbox" value="64" checked> 64x64</label>
+            <label><input type="checkbox" value="48" checked> 48x48</label>
+            <label><input type="checkbox" value="32" checked> 32x32</label>
+            <label><input type="checkbox" value="24" checked> 24x24</label>
+            <label><input type="checkbox" value="16" checked> 16x16</label>
+        </div>
+        <div id="customIconSize">
+            <label for="customIconSizeInput">Custom Size:</label>
+            <input type="number" id="customIconSizeInput" min="1" max="256" value="1">
+            <button id="addCustomSizeButton">Add Custom Size</button>
+        </div>
+        <button id="convertToIconButton">Convert to Icon</button>
+        <button id="downloadIconButton" disabled>Download Icon</button>
+        <button id="importIconDataButton" disabled>Import to Raw Data</button>
+    </div>
+    <div class="control-group" id="reversedIconConverterSection">
+        <h3>Reversed Image to Icon Converter</h3>
+        <input type="file" id="reversedIconInput" accept="image/*">
+        <div id="reversedIconSizes">
+            <label><input type="checkbox" value="16" checked> 16x16</label>
+            <label><input type="checkbox" value="24" checked> 24x24</label>
+            <label><input type="checkbox" value="32" checked> 32x32</label>
+            <label><input type="checkbox" value="48" checked> 48x48</label>
+            <label><input type="checkbox" value="64" checked> 64x64</label>
+            <label><input type="checkbox" value="96" checked> 96x96</label>
+            <label><input type="checkbox" value="128" checked> 128x128</label>
+            <label><input type="checkbox" value="256" checked> 256x256</label>
+        </div>
+        <div id="reversedCustomIconSize">
+            <label for="reversedCustomIconSizeInput">Custom Size:</label>
+            <input type="number" id="reversedCustomIconSizeInput" min="1" max="256" value="1">
+            <button id="reversedAddCustomSizeButton">Add Custom Size</button>
+        </div>
+        <button id="reversedConvertToIconButton">Convert to Icon</button>
+        <button id="reversedDownloadIconButton" disabled>Download Icon</button>
+        <button id="reversedImportIconDataButton" disabled>Import to Raw Data</button>
+    </div>
+    <div class="control-group" id="imageConverterSection">
+        <h3>Image to Raw Data Converter</h3>
+        <input type="file" id="imageInput" accept="image/*">
+        <button id="convertImageButton">Convert Image to Raw Data</button>
+    </div>
+    <div class="control-group" id="audioConverterSection">
+        <h3>Audio to Raw PCM Converter</h3>
+        <input type="file" id="audioInput" accept="audio/*">
+        <select id="audioOutputFormat">
+            <option value="uint8">Unsigned 8-bit PCM</option>
+            <option value="int16">Signed 16-bit PCM</option>
+            <option value="int24">Signed 24-bit PCM</option>
+            <option value="int32">Signed 32-bit PCM</option>
+            <option value="float32">32-bit Float</option>
+        </select>
+        <button id="convertAudioButton">Convert Audio to Raw PCM</button>
+        <button id="importAudioDataButton" disabled>Import to Raw Data</button>
+    </div>
+    <div class="control-group" id="bytebeatSection">
+        <h3>Bytebeat Generator</h3>
+        <textarea id="bytebeatFormula" rows="3" cols="40" placeholder="Bytebeat: (t * 5 & t >> 7) | (t * 3 & t >> 10)&#10;Floatbeat: Math.sin(t/64)">t & t >> 8</textarea>
+        <button id="generateBytebeatButton">Generate Bytebeat</button>
+        <select id="bytebeatType">
+            <option value="bytebeat">Bytebeat</option>
+            <option value="floatbeat">Floatbeat</option>
+        </select>
+        <select id="bytebeatSampleType" style="display: inline-block;">
+            <option value="uint8">8-bit Unsigned</option>
+            <option value="int8">8-bit Signed</option>
+        </select>
+        <label>
+            <input type="number" id="bytebeatDuration" value="10" min="1" max="60"> seconds
+        </label>
+    </div>
+    <div class="control-group">
+        <label for="customSpeedInput">Custom Speed:</label>
+        <input type="number" id="customSpeedInput" min="0.5" max="1000" step="0.1" value="1">
+        <button id="applyCustomSpeedButton">Apply Custom Speed</button>
+    </div>
+    <div class="control-group">
+    </div>
+    <div class="comparison-container">
+      <div class="comparison-content">
+        <h3>Comparison: ffmpeg vs Binary Waterfall vs Raw Data Media Player</h3>
+        <table class="comparison-table">
+          <tr>
+            <th>Feature</th>
+            <th>ffmpeg</th>
+            <th>Binary Waterfall</th>
+            <th>Raw Data Media Player</th>
+          </tr>
+          <tr>
+            <td>Input Format</td>
+            <td>Raw video (rgb32)</td>
+            <td>Any binary file</td>
+            <td>Any binary file</td>
+          </tr>
+          <tr>
+            <td>Audio Support</td>
+            <td>Yes</td>
+            <td>Yes</td>
+            <td>Yes</td>
+          </tr>
+          <tr>
+            <td>Real-time Playback</td>
+            <td>No (Generates output file)</td>
+            <td>Yes</td>
+            <td>Yes</td>
+          </tr>
+          <tr>
+            <td>XYZ Visualization</td>
+            <td>No</td>
+            <td>No</td>
+            <td>Yes (XY Oscilloscope)</td>
+          </tr>
+        </tr>
+      </table>
+    </div>
+    </div>
+    <div id="aboutModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>About Raw Data Media Player</h2>
+            <p>Version: <span id="versionNumber"></span></p>
+            <p>Raw Data Media Player is an advanced web-based tool for visualizing and playing binary data as both video and audio. It supports multiple color modes, PCM formats, and provides real-time visualization features.</p>
+            <p>Built with:</p>
+            <ul>
+                <li>HTML5 Canvas for video rendering</li>
+                <li>Web Audio API for audio playback</li>
+                <li>CSS3 for styling and animations</li>
+            </ul>
+            <p>Features:</p>
+            <ul>
+                <li>Multiple color modes (RGB32, RGB24, RGB565, etc.)</li>
+                <li>Various PCM audio formats (8-bit to 32-bit, including float)</li>
+                <li>Real-time waveform and XY oscilloscope</li>
+                <li>Custom playback speeds</li>
+                <li>Screenshot capability</li>
+                <li>Canvas size adjustment</li>
+                <li>Volume control</li>
+                <li>File conversion tools</li>
+            </ul>
+        </div>
+    </div>
+</body>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('versionNumber').textContent = '2.0.0';
+    canvas = document.getElementById('canvas');
+    ctx = canvas.getContext('2d');
+    canvas.width = CANVAS_WIDTH;
+    canvas.height = CANVAS_HEIGHT;
+    ctx.imageSmoothingEnabled = false;
+    
+    waveformCanvas = document.getElementById('waveform');
+    waveformCtx = waveformCanvas.getContext('2d');
+    
+    loadCookies();
+    updateCanvasSize();
+    
+    // Update Fix Lags button text to match initial state
+    const fixLagsButton = document.getElementById('fixLagsButton');
+    fixLagsButton.textContent = isFixingLags ? 'Restore Quality' : 'Fix Lags';
+    
+    // Show initial alert about lag prevention
+    showAlert('Started with reduced quality to prevent lags. Click "Restore Quality" if your device can handle full quality.');
+    
+    document.getElementById('fileInput').addEventListener('change', handleFileSelect);
+    document.getElementById('playButton').addEventListener('click', togglePlayback);
+    document.getElementById('stopButton').addEventListener('click', stopPlayback);
+    document.getElementById('restartButton').addEventListener('click', restartPlayback);
+    document.getElementById('generateButton').addEventListener('click', generateRandomData);
+    document.getElementById('volumeSlider').addEventListener('input', changeVolume);
+    document.getElementById('canvasWidthInput').addEventListener('change', updateCanvasSize);
+    document.getElementById('canvasHeightInput').addEventListener('change', updateCanvasSize);
+    document.getElementById('sampleRateInput').addEventListener('change', updateSampleRate);
+    document.getElementById('colorModeSelect').addEventListener('change', changeColorMode);
+    document.getElementById('pcmFormatSelect').addEventListener('change', changePCMFormat);
+    document.getElementById('toggleStereoButton').addEventListener('click', toggleStereo);
+    document.getElementById('loopCheckbox').addEventListener('change', toggleLoop);
+    document.getElementById('waveformCheckbox').addEventListener('change', toggleWaveform);
+    document.getElementById('oscilloscopeCheckbox').addEventListener('change', toggleOscilloscope);
+    document.getElementById('nearestNeighborCheckbox').addEventListener('change', toggleNearestNeighbor);
+    document.getElementById('screenshotButton').addEventListener('click', takeScreenshot);
+    document.getElementById('startRecordingButton').addEventListener('click', startRecording);
+    document.getElementById('stopRecordingButton').addEventListener('click', stopRecording);
+    document.getElementById('stopRecordingButton').style.display = 'none';
+    document.getElementById('fixCanvasButton').addEventListener('click', fixCanvasGoingFast);
+    document.getElementById('fixIOSAudioButton').addEventListener('click', fixIOSAudio);
+    document.getElementById('generateBytebeatButton').addEventListener('click', generateBytebeat);
+    
+    document.getElementById('fixLagsButton').addEventListener('click', () => {
+        isFixingLags = !isFixingLags;
+        const button = document.getElementById('fixLagsButton');
+        button.textContent = isFixingLags ? 'Restore Quality' : 'Fix Lags';
+        if (isPlaying) {
+            stopPlayback();
+            startPlayback();
+        }
+        showAlert(isFixingLags ? 'Canvas quality reduced to fix lags' : 'Original canvas quality restored');
+    });
+
+    document.getElementById('normalRewindButton').addEventListener('click', () => {
+        playbackSpeed = normalRewindSpeed;
+        if (!isPlaying) startPlayback();
+    });
+
+    document.getElementById('normalButton').addEventListener('click', () => {
+        playbackSpeed = normalSpeed;
+        if (!isPlaying) startPlayback();
+    });
+
+    document.getElementById('toggleCanvasOrientationButton').addEventListener('click', () => {
+        isCanvasUpsideDown = !isCanvasUpsideDown;
+        document.getElementById('toggleCanvasOrientationButton').textContent = 
+            isCanvasUpsideDown ? 'Flip Canvas Up' : 'Flip Canvas Down';
+        saveCookies();
+    });
+
+    const aboutModal = document.getElementById('aboutModal');
+    const aboutButton = document.getElementById('aboutButton');
+    const closeButton = document.getElementsByClassName('close')[0];
+
+    aboutButton.addEventListener('click', () => {
+        aboutModal.style.display = 'block';
+    });
+
+    closeButton.addEventListener('click', () => {
+        aboutModal.style.display = 'none';
+    });
+
+    window.addEventListener('click', (event) => {
+        if (event.target === aboutModal) {
+            aboutModal.style.display = 'none';
+        }
+    });
+
+    document.getElementById('customSpeedInput').addEventListener('change', (e) => {
+        customSpeed = parseFloat(e.target.value);
+    });
+
+    document.getElementById('applyCustomSpeedButton').addEventListener('click', () => {
+        playbackSpeed = customSpeed;
+        if (!isPlaying) startPlayback();
+    });
+
+    const positionCanvas = document.getElementById('positionCanvas');
+    positionCanvas.width = 800;
+    positionCanvas.height = 20;
+
+    showAlert('Raw Data Media Player initialized successfully!');
+    requestAnimationFrame(update60FPSCounters);
+});
+</script>
+</html>
